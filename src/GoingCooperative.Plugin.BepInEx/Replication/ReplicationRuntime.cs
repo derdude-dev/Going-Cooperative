@@ -18,6 +18,8 @@ namespace GoingCooperative.Plugin.BepInEx
         private static bool replicationRuntimeStartAttempted;
         private static bool replicationRemoteHelloReceived;
         private static bool replicationRemoteCompatibilityRefused;
+        private static float replicationLastRemoteDataReceivedRealtime;
+        private static bool replicationConnectionLost;
         private static string replicationLocalBuildHash = string.Empty;
         private static string replicationGameAssemblyModuleVersionId = string.Empty;
         private static float replicationNextHelloRealtime;
@@ -114,6 +116,7 @@ namespace GoingCooperative.Plugin.BepInEx
         private const int ReplicationRegionOrderMarkerSnapshotMaxStates = 64;
         private const int ReplicationHostCommandResultRetention = 8192;
         private const int ReplicationBuildingDurableBackpressureLimit = 16;
+        private const float ReplicationPeerLivenessTimeoutSeconds = 15f;
 
         private void TryStartReplicationRuntime()
         {
@@ -178,6 +181,24 @@ namespace GoingCooperative.Plugin.BepInEx
             }
 
             replicationLastRuntimeUpdateFrame = frame;
+            // Measured here rather than around the call site: five game-side hooks call
+            // this method and the frame guard above means only the first one each frame
+            // does real work, so timing any single caller reports ~0.
+            var runtimeUpdateStartedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                UpdateReplicationRuntimeCore();
+            }
+            finally
+            {
+                RecordReplicationRuntimeUpdateCost(
+                    (System.Diagnostics.Stopwatch.GetTimestamp() - runtimeUpdateStartedTimestamp)
+                    * 1000d / System.Diagnostics.Stopwatch.Frequency);
+            }
+        }
+
+        private void UpdateReplicationRuntimeCore()
+        {
             UpdateReplicationPerfFpsProbe();
             UpdateReplicationPathingPerfDiagnostics();
 
@@ -195,8 +216,15 @@ namespace GoingCooperative.Plugin.BepInEx
             // Commit synchronous shelf/stockpile UI edits before inbound state can
             // be applied in this frame. This preserves the optimistic overlay until
             // the host returns a complete authoritative proof row.
+            var storageFlushStarted = BeginReplicationRuntimeSection();
             FlushReplicationStoragePolicyChanges();
+            EndReplicationRuntimeSection(ReplicationRuntimeSection.StorageFlush, storageFlushStarted);
+
+            var pumpStarted = BeginReplicationRuntimeSection();
             PumpReplicationTransport();
+            EndReplicationRuntimeSection(ReplicationRuntimeSection.Pump, pumpStarted);
+
+            UpdateReplicationPeerLivenessState();
             WarnReplicationTransportDropsIfDue();
             SendReplicationHelloIfDue();
             if (replicationConfigHostMode)
@@ -206,6 +234,7 @@ namespace GoingCooperative.Plugin.BepInEx
                 // half-alive session (game time and world deltas flowing, snapshots dead).
                 if (replicationRemoteHelloReceived)
                 {
+                    var hostSendStarted = BeginReplicationRuntimeSection();
                     SendHostTransformSnapshotIfDue();
                     // Production V2 replaces only workstation ticket containers.
                     // Pawn haul/food/medicine inventories still belong to the shared
@@ -228,10 +257,12 @@ namespace GoingCooperative.Plugin.BepInEx
                     UpdateReplicationCropfieldPolicyV1Host();
                     UpdateReplicationPrioritisedObjectWorkV1();
                     SendPendingReplicationWorldObjectDeltasIfDue();
+                    EndReplicationRuntimeSection(ReplicationRuntimeSection.HostSend, hostSendStarted);
                 }
             }
             else
             {
+                var clientDeltaApplyStarted = BeginReplicationRuntimeSection();
                 UpdateReplicationBuildingLifecycleV2();
                 SendClientProofIntentIfDue();
                 SendPendingReplicationCommandIntentsIfDue();
@@ -239,12 +270,17 @@ namespace GoingCooperative.Plugin.BepInEx
                 ProcessPendingReplicationWorldObjectDeltaApplies();
                 ProcessPendingReplicationResourceContainerApplies();
                 ProcessPendingReplicationResourcePileStateSnapshotApplies();
+                EndReplicationRuntimeSection(ReplicationRuntimeSection.ClientDeltaApply, clientDeltaApplyStarted);
+
+                var clientPresentationStarted = BeginReplicationRuntimeSection();
                 TickReplicationHostDrivenGoapPlaybackAgents();
                 ProcessReplicationPuppetActionStates();
                 TickReplicationPuppetActionVisuals();
                 ProcessPendingReplicationNeedsRepairs();
+                EndReplicationRuntimeSection(ReplicationRuntimeSection.ClientPresentation, clientPresentationStarted);
             }
 
+            var sharedPresentationStarted = BeginReplicationRuntimeSection();
             UpdateReplicationProductionStateV2();
             UpdateReplicationMedicalV1();
             ProcessReplicationSemanticAgentMotionPresentation();
@@ -252,6 +288,7 @@ namespace GoingCooperative.Plugin.BepInEx
             ProcessReplicationCombatPresentationExpiry();
             ProcessReplicationEventRuntime();
             UpdateReplicationTraderPartyTransfers();
+            EndReplicationRuntimeSection(ReplicationRuntimeSection.SharedPresentation, sharedPresentationStarted);
 
             if (!replicationConfigHostMode && ProcessReplicationBuildBatchRecoveryRequest())
             {
@@ -269,6 +306,8 @@ namespace GoingCooperative.Plugin.BepInEx
             replicationRuntimeStartAttempted = false;
             replicationRemoteHelloReceived = false;
             replicationRemoteCompatibilityRefused = false;
+            replicationLastRemoteDataReceivedRealtime = 0f;
+            replicationConnectionLost = false;
             replicationLocalBuildHash = string.Empty;
             ResetReplicationCombatRuntimeState();
             ResetReplicationMedicalV1State();
@@ -436,6 +475,7 @@ namespace GoingCooperative.Plugin.BepInEx
             ReplicationAgentActionStatusByEntityId.Clear();
             ReplicationLastAgentCharacterStateSignatureByEntityId.Clear();
             ReplicationClientAgentCharacterStateByEntityId.Clear();
+            ReplicationClientAppliedAgentNameByEntityId.Clear();
             ReplicationPuppetActionStateByEntityId.Clear();
             ReplicationPuppetActionHandItemByEntityId.Clear();
             ClearReplicationPuppetActionHandProps();
@@ -466,6 +506,7 @@ namespace GoingCooperative.Plugin.BepInEx
             while (replicationTransport.TryReceive(out var envelope))
             {
                 messageCount++;
+                replicationLastRemoteDataReceivedRealtime = Time.realtimeSinceStartup;
                 try
                 {
                 switch (envelope.Kind)
@@ -520,6 +561,34 @@ namespace GoingCooperative.Plugin.BepInEx
             }
 
             RecordReplicationPathingPump(perfStarted, messageCount);
+        }
+
+        private void UpdateReplicationPeerLivenessState()
+        {
+            if (!replicationRemoteHelloReceived)
+            {
+                replicationConnectionLost = false;
+                return;
+            }
+
+            var secondsSinceLastData = Time.realtimeSinceStartup - replicationLastRemoteDataReceivedRealtime;
+            if (secondsSinceLastData > ReplicationPeerLivenessTimeoutSeconds)
+            {
+                if (!replicationConnectionLost)
+                {
+                    replicationConnectionLost = true;
+                    LogReplicationWarning("Going Cooperative replication CONNECTION LOST peer="
+                        + (replicationConfigHostMode ? "client" : "host")
+                        + " secondsSinceLastData="
+                        + secondsSinceLastData.ToString("F1", CultureInfo.InvariantCulture));
+                }
+            }
+            else if (replicationConnectionLost)
+            {
+                replicationConnectionLost = false;
+                LogReplicationInfo("Going Cooperative replication connection restored peer="
+                    + (replicationConfigHostMode ? "client" : "host"));
+            }
         }
 
         private void SendReplicationHelloIfDue()
@@ -2377,6 +2446,8 @@ namespace GoingCooperative.Plugin.BepInEx
                 + replicationRemoteHelloReceived
                 + " compatibilityRefused="
                 + replicationRemoteCompatibilityRefused
+                + " connectionLost="
+                + replicationConnectionLost
                 + " protocol="
                 + ReplicationPayloadCodec.ProtocolVersion
                 + " buildHash="

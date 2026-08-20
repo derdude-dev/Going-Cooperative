@@ -16,6 +16,66 @@ namespace GoingCooperative.Plugin.BepInEx
         private static int replicationPerfWindowOver50Ms;
         private static int replicationPerfWindowOver100Ms;
         private static int replicationPerfLastUpdateFrame = -1;
+        // Total wall time spent inside UpdateReplicationRuntime per window. The existing
+        // buckets (collect/semantic/pump/...) only cover individually instrumented
+        // sections and together accounted for ~4% of frame time, leaving it unknown
+        // whether the rest sits in uninstrumented mod code or outside the mod entirely.
+        private static double replicationPerfWindowRuntimeUpdateMs;
+        private static double replicationPerfWindowRuntimeUpdateMaxMs;
+
+        // Breakdown of the runtime update. runtimeUpdateMs showed ~73% of client frame
+        // time inside the mod while the previously instrumented buckets summed to ~4%,
+        // so the cost sits in blocks nobody was timing. These split the update into the
+        // coarse phases so the next capture names the expensive one instead of guessing.
+        private enum ReplicationRuntimeSection
+        {
+            StorageFlush = 0,
+            Pump,
+            HostSend,
+            ClientDeltaApply,
+            ClientPresentation,
+            SharedPresentation,
+            Count,
+        }
+
+        private static readonly double[] ReplicationPerfWindowSectionMs =
+            new double[(int)ReplicationRuntimeSection.Count];
+
+        private static readonly string[] ReplicationRuntimeSectionNames =
+        {
+            "storageFlushMs",
+            "pumpSectionMs",
+            "hostSendMs",
+            "clientDeltaApplyMs",
+            "clientPresentationMs",
+            "sharedPresentationMs",
+        };
+
+        private static long BeginReplicationRuntimeSection()
+        {
+            return System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        private static void EndReplicationRuntimeSection(ReplicationRuntimeSection section, long startedTimestamp)
+        {
+            ReplicationPerfWindowSectionMs[(int)section] +=
+                (System.Diagnostics.Stopwatch.GetTimestamp() - startedTimestamp)
+                * 1000d / System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private static string FormatReplicationRuntimeSectionBreakdown()
+        {
+            var builder = new System.Text.StringBuilder(160);
+            for (var i = 0; i < ReplicationRuntimeSectionNames.Length; i++)
+            {
+                builder.Append(' ')
+                    .Append(ReplicationRuntimeSectionNames[i])
+                    .Append('=')
+                    .Append(ReplicationPerfWindowSectionMs[i].ToString("0.###", CultureInfo.InvariantCulture));
+            }
+
+            return builder.ToString();
+        }
         private static bool replicationPerfProbeDisabledLogged;
         private static bool replicationPerfProbeEnabledLogged;
         private static long replicationPerfLastSnapshotsSent;
@@ -139,6 +199,11 @@ namespace GoingCooperative.Plugin.BepInEx
 
             LogReplicationInfo("Going Cooperative perf fps window side="
                 + (replicationConfigHostMode ? "host" : "client")
+                // Lets a multi-minute stall be cross-referenced against real wall-clock
+                // time (autosave schedule, OS/AV activity) even when it isn't caused by
+                // a focus/pause change and so has no OnApplicationFocus/Pause log line.
+                + " wallClockUtc="
+                + DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture)
                 + " elapsed="
                 + elapsed.ToString("0.###", CultureInfo.InvariantCulture)
                 + " frames="
@@ -157,6 +222,11 @@ namespace GoingCooperative.Plugin.BepInEx
                 + replicationPerfWindowOver50Ms.ToString(CultureInfo.InvariantCulture)
                 + " over100ms="
                 + replicationPerfWindowOver100Ms.ToString(CultureInfo.InvariantCulture)
+                + " runtimeUpdateMs="
+                + replicationPerfWindowRuntimeUpdateMs.ToString("0.###", CultureInfo.InvariantCulture)
+                + " runtimeUpdateMaxMs="
+                + replicationPerfWindowRuntimeUpdateMaxMs.ToString("0.###", CultureInfo.InvariantCulture)
+                + FormatReplicationRuntimeSectionBreakdown()
                 + " snapshotsSent="
                 + snapshotsSent.ToString(CultureInfo.InvariantCulture)
                 + " snapshotsReceived="
@@ -247,6 +317,9 @@ namespace GoingCooperative.Plugin.BepInEx
             replicationPerfWindowOver33Ms = 0;
             replicationPerfWindowOver50Ms = 0;
             replicationPerfWindowOver100Ms = 0;
+            replicationPerfWindowRuntimeUpdateMs = 0d;
+            replicationPerfWindowRuntimeUpdateMaxMs = 0d;
+            Array.Clear(ReplicationPerfWindowSectionMs, 0, ReplicationPerfWindowSectionMs.Length);
             replicationPerfLastUpdateFrame = -1;
         }
 
@@ -260,6 +333,18 @@ namespace GoingCooperative.Plugin.BepInEx
             replicationPerfWindowOver33Ms = 0;
             replicationPerfWindowOver50Ms = 0;
             replicationPerfWindowOver100Ms = 0;
+            replicationPerfWindowRuntimeUpdateMs = 0d;
+            replicationPerfWindowRuntimeUpdateMaxMs = 0d;
+            Array.Clear(ReplicationPerfWindowSectionMs, 0, ReplicationPerfWindowSectionMs.Length);
+        }
+
+        private static void RecordReplicationRuntimeUpdateCost(double elapsedMs)
+        {
+            replicationPerfWindowRuntimeUpdateMs += elapsedMs;
+            if (elapsedMs > replicationPerfWindowRuntimeUpdateMaxMs)
+            {
+                replicationPerfWindowRuntimeUpdateMaxMs = elapsedMs;
+            }
         }
     }
 }

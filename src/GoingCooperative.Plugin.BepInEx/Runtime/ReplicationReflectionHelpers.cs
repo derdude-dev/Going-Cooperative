@@ -15,6 +15,7 @@ namespace GoingCooperative.Plugin.BepInEx
         private static readonly object ReflectionLookupCacheLock = new object();
         private static readonly Dictionary<string, PropertyInfo?> InstancePropertyLookupCache = new Dictionary<string, PropertyInfo?>(StringComparer.Ordinal);
         private static readonly Dictionary<string, FieldInfo?> InstanceFieldLookupCache = new Dictionary<string, FieldInfo?>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, PropertyInfo?> StaticPropertyLookupCache = new Dictionary<string, PropertyInfo?>(StringComparer.Ordinal);
 
         private int TryPatchPassiveCommandSurfaceMethodsByName(Harmony harmonyInstance, HarmonyMethod postfix, string typeName, string methodName)
         {
@@ -408,6 +409,39 @@ namespace GoingCooperative.Plugin.BepInEx
             }
 
             return field;
+        }
+
+        // Same rationale as GetCachedInstanceProperty: AccessTools.Property() re-probes
+        // and re-logs a Harmony warning on every miss with no memoization of its own,
+        // which is expensive when called once per world-object instance. This mirrors
+        // that helper but for static singleton-style "Instance" accessors.
+        private static PropertyInfo? GetCachedStaticProperty(Type type, string memberName)
+        {
+            var key = BuildReflectionLookupCacheKey(type, memberName);
+            lock (ReflectionLookupCacheLock)
+            {
+                if (StaticPropertyLookupCache.TryGetValue(key, out var cached))
+                {
+                    return cached;
+                }
+            }
+
+            PropertyInfo? property = null;
+            for (var current = type; current != null; current = current.BaseType)
+            {
+                property = current.GetProperty(memberName, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (property != null)
+                {
+                    break;
+                }
+            }
+
+            lock (ReflectionLookupCacheLock)
+            {
+                StaticPropertyLookupCache[key] = property;
+            }
+
+            return property;
         }
 
         private static string BuildReflectionLookupCacheKey(Type type, string memberName)

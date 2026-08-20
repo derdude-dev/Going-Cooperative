@@ -1887,7 +1887,7 @@ namespace GoingCooperative.Plugin.BepInEx
         private static bool TryResolveReplicationModelId(object value, out string id)
         {
             id = string.Empty;
-            var blueprint = AccessTools.Property(value.GetType(), "Blueprint")?.GetValue(value, null);
+            var blueprint = GetCachedInstanceProperty(value.GetType(), "Blueprint")?.GetValue(value, null);
             var source = blueprint ?? value;
             var method = AccessTools.Method(source.GetType(), "GetID", Type.EmptyTypes);
             id = method?.Invoke(source, null) as string ?? string.Empty;
@@ -1912,9 +1912,9 @@ namespace GoingCooperative.Plugin.BepInEx
             if (mode == 0) return 1;
             if (mode == 1) return 0;
 
-            var blueprint = AccessTools.Property(ticket.GetType(), "Blueprint")?.GetValue(ticket, null);
+            var blueprint = GetCachedInstanceProperty(ticket.GetType(), "Blueprint")?.GetValue(ticket, null);
             if (blueprint == null) return 10;
-            var jobType = AccessTools.Property(blueprint.GetType(), "JobType")?.GetValue(blueprint, null);
+            var jobType = GetCachedInstanceProperty(blueprint.GetType(), "JobType")?.GetValue(blueprint, null);
             if (jobType != null && Convert.ToInt32(jobType, CultureInfo.InvariantCulture) == 4096
                 && TryResolveReplicationModelId(blueprint, out var researchBlueprintId))
             {

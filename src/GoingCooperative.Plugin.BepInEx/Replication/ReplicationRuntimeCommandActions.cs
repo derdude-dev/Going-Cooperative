@@ -1332,7 +1332,7 @@ namespace GoingCooperative.Plugin.BepInEx
 
         private static object? ResolveReplicationUnityManagerInstance(Type managerType)
         {
-            var instanceProperty = AccessTools.Property(managerType, "Instance");
+            var instanceProperty = GetCachedStaticProperty(managerType, "Instance");
             try
             {
                 var instance = instanceProperty?.GetValue(null, null);

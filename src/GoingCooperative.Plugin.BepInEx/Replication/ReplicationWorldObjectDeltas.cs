@@ -45,6 +45,7 @@ namespace GoingCooperative.Plugin.BepInEx
         private static readonly Dictionary<object, ReplicationGoapActionOwnerBinding> ReplicationGoapActionOwnerBindings = new Dictionary<object, ReplicationGoapActionOwnerBinding>();
         private static readonly Dictionary<string, ulong> ReplicationLastAgentCharacterStateSignatureByEntityId = new Dictionary<string, ulong>(StringComparer.Ordinal);
         private static readonly Dictionary<string, ReplicationAgentCharacterState> ReplicationClientAgentCharacterStateByEntityId = new Dictionary<string, ReplicationAgentCharacterState>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, string> ReplicationClientAppliedAgentNameByEntityId = new Dictionary<string, string>(StringComparer.Ordinal);
         private static readonly Dictionary<string, ReplicationPuppetActionState> ReplicationPuppetActionStateByEntityId = new Dictionary<string, ReplicationPuppetActionState>(StringComparer.Ordinal);
         private static readonly Dictionary<string, string> ReplicationPuppetActionHandItemByEntityId = new Dictionary<string, string>(StringComparer.Ordinal);
         private static readonly Dictionary<string, GameObject> ReplicationPuppetActionHandPropByEntityId = new Dictionary<string, GameObject>(StringComparer.Ordinal);
@@ -3007,6 +3008,10 @@ namespace GoingCooperative.Plugin.BepInEx
                         + FormatReplicationBool(state.IsDrafting)
                         + " combatB64="
                         + EncodeReplicationDetailBase64(state.CombatMode)
+                        + " firstB64="
+                        + EncodeReplicationDetailBase64(state.FirstName)
+                        + " lastB64="
+                        + EncodeReplicationDetailBase64(state.LastName)
                         + needsPayload
                         + " statsSig=0x"
                         + state.StatsSignature.ToString("X16", CultureInfo.InvariantCulture)
@@ -3680,6 +3685,21 @@ namespace GoingCooperative.Plugin.BepInEx
                 && storagePending.SendCount >= ReplicationWorldObjectDeltaMaxSends)
             {
                 return ReplicationStoragePolicyStateDurableRetrySeconds;
+            }
+
+            // Back off the generic lane instead of retrying at a fixed cadence forever.
+            // A peer that is behind acknowledges later than the fixed window, so every
+            // window produced another copy; the extra traffic then deepened the very
+            // backlog causing the delay. Growing the interval per attempt keeps fast
+            // recovery for a genuinely dropped first send while preventing a struggling
+            // peer from being buried. Capped so a lost packet still recovers promptly.
+            if (replicationPendingWorldObjectDeltas.TryGetValue(delta.Sequence, out var genericPending)
+                && genericPending.SendCount > 1)
+            {
+                var backoffSteps = Math.Min(
+                    genericPending.SendCount - 1,
+                    ReplicationWorldObjectDeltaRetryBackoffMaxSteps);
+                return ReplicationWorldObjectDeltaRetrySeconds * (1 << backoffSteps);
             }
 
             return ReplicationWorldObjectDeltaRetrySeconds;
@@ -4376,6 +4396,25 @@ namespace GoingCooperative.Plugin.BepInEx
             HandleReplicationTraderPartyWorldDeltaAck(ack);
             TryHandleReplicationBuildingLifecycleRepairAckV2(ack);
 
+            // "duplicate-sequence-queued" means the peer already holds this delta and is
+            // only waiting on its frame-budgeted apply queue. It stays pending (the apply
+            // can still fail), but resending is pure waste: it costs bandwidth, another
+            // decode, and another ack on a peer that is by definition already behind.
+            // Without this, a peer whose ack latency exceeds the fixed retry window gets
+            // retried every window and the extra traffic deepens the backlog that caused
+            // the delay - the amplification behind most observed retries.
+            if (!ack.Applied
+                && ack.Detail.IndexOf("duplicate-sequence-queued", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                lock (ReplicationWorldObjectDeltaLock)
+                {
+                    if (replicationPendingWorldObjectDeltas.TryGetValue(ack.Sequence, out var queuedPending))
+                    {
+                        queuedPending.LastSentRealtime = Time.realtimeSinceStartup;
+                    }
+                }
+            }
+
             var removed = false;
             ReplicationWorldObjectDelta? positivelyAcknowledgedBuildBatchResult = null;
             ReplicationWorldObjectDelta? acknowledgedBuildingLifecycleV2Delta = null;
@@ -4488,7 +4527,13 @@ namespace GoingCooperative.Plugin.BepInEx
                 || detail.IndexOf("unsupported-delta-kind", StringComparison.OrdinalIgnoreCase) >= 0
                 || detail.IndexOf("already-applied-or-no-ground", StringComparison.OrdinalIgnoreCase) >= 0
                 || detail.IndexOf("duplicate-sequence-skipped", StringComparison.OrdinalIgnoreCase) >= 0
-                || detail.IndexOf("building-state-snapshot-not-converged", StringComparison.OrdinalIgnoreCase) >= 0;
+                || detail.IndexOf("building-state-snapshot-not-converged", StringComparison.OrdinalIgnoreCase) >= 0
+                // TryResolveReplicationBuildingRepairTargetV2 could not find the target
+                // building AND the repair delta carries no embedded exact-replay seed.
+                // Both facts are fixed properties of this one delta instance - resending
+                // the identical payload can never change the outcome, so retrying it
+                // forever only wastes bandwidth/CPU on a permanently missing building.
+                || detail.IndexOf("identity-missing exact-replay-unavailable", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static bool IsReplicationResourcePileStateSnapshotDelta(ReplicationWorldObjectDelta delta)
@@ -4589,13 +4634,81 @@ namespace GoingCooperative.Plugin.BepInEx
             return Time.realtimeSinceStartup >= replicationClientResourcePileStateSnapshotApplyReadyRealtime;
         }
 
-        private static bool TryApplyReplicationWorldObjectDelta(ReplicationWorldObjectDelta delta, out string detail)
+        private delegate bool ReplicationWorldObjectDeltaHandler(ReplicationWorldObjectDelta delta, out string detail);
+
+        private static Dictionary<string, ReplicationWorldObjectDeltaHandler>? replicationWorldObjectDeltaHandlersByKind;
+
+        // Lazily built on first use (not a field initializer) so it never races the
+        // declaration order of the DeltaKind constants across this partial class's
+        // other source files - the type's static constructor has already finished
+        // running by the time any method on it can be called.
+        private static Dictionary<string, ReplicationWorldObjectDeltaHandler> GetReplicationWorldObjectDeltaHandlersByKind()
         {
-            if (string.Equals(delta.DeltaKind, ReplicationPlantLifecycleSpawnDeltaKind, StringComparison.Ordinal))
+            if (replicationWorldObjectDeltaHandlersByKind != null)
             {
-                return TryApplyReplicationPlantLifecycleV1(delta, out detail);
+                return replicationWorldObjectDeltaHandlersByKind;
             }
 
+            var map = new Dictionary<string, ReplicationWorldObjectDeltaHandler>(StringComparer.Ordinal)
+            {
+                [ReplicationPlantLifecycleSpawnDeltaKind] = TryApplyReplicationPlantLifecycleV1,
+                [CombatStateDeltaKind] = TryApplyReplicationCombatWorldDelta,
+                [CombatOutcomeDeltaKind] = TryApplyReplicationCombatWorldDelta,
+                [CombatPresentationDeltaKind] = TryApplyReplicationCombatWorldDelta,
+                [CombatHealthDeltaKind] = TryApplyReplicationCombatWorldDelta,
+                [CombatDeathDeltaKind] = TryApplyReplicationCombatWorldDelta,
+                [ManagementDeltaKind] = TryApplyReplicationManagementDelta,
+                [ReplicationMedicalWoundStateDeltaKind] = TryApplyReplicationMedicalWorldDelta,
+                [ReplicationPrioritisedObjectWorkResultV1DeltaKind] = TryApplyReplicationPrioritisedObjectWorkResultV1,
+                ["MapResourceDisposed"] = TryApplyReplicationMapResourceDisposed,
+                ["ResourcePileSpawned"] = TryApplyReplicationResourcePileSpawned,
+                ["ResourcePileAmountAdded"] = TryApplyReplicationResourcePileAmountAdded,
+                ["ResourcePileStateSnapshotBegin"] = TryApplyReplicationResourcePileStateSnapshotBegin,
+                ["ResourcePileState"] = TryApplyReplicationResourcePileState,
+                ["ResourcePileStateSnapshotEnd"] = TryApplyReplicationResourcePileStateSnapshotEnd,
+                ["ResourcePileDisposed"] = TryApplyReplicationResourcePileDisposed,
+                ["TerrainGroundDestroyed"] = TryApplyReplicationTerrainGroundDestroyed,
+                ["BuildingBlueprintPlaced"] = TryApplyReplicationBuildingBlueprintPlaced,
+                [ReplicationBuildingBlueprintBatchPlacedDeltaKind] = TryApplyReplicationBuildingBlueprintBatchPlaced,
+                [ReplicationBuildingBlueprintBatchResultDeltaKind] = TryApplyReplicationBuildingBlueprintBatchResult,
+                [ReplicationBuildingLifecycleV2DeltaKind] = TryApplyReplicationBuildingLifecycleV2,
+                [ReplicationBuildingProgressV2DeltaKind] = TryApplyReplicationBuildingProgressV2,
+                [ReplicationBuildingRepairV2DeltaKind] = TryApplyReplicationBuildingRepairV2,
+                [ReplicationBuildingRecoveryRequiredV2DeltaKind] = TryApplyReplicationBuildingRecoveryRequiredV2,
+                ["BuildingBlueprintRejected"] = TryApplyReplicationBuildingBlueprintRejected,
+                ["BuildingStateSnapshotBegin"] = TryApplyReplicationBuildingStateSnapshotBegin,
+                ["BuildingState"] = TryApplyReplicationBuildingState,
+                ["BuildingStateSnapshotEnd"] = TryApplyReplicationBuildingStateSnapshotEnd,
+                ["AgentCarryEquipped"] = TryApplyReplicationAgentCarryDelta,
+                ["AgentCarryCleared"] = TryApplyReplicationAgentCarryDelta,
+                ["AgentCarryResourceChanged"] = TryApplyReplicationAgentCarryResourceDelta,
+                ["AgentCarryResourceCleared"] = TryApplyReplicationAgentCarryResourceDelta,
+                [ReplicationAgentWorkPresentationDeltaKind] = TryApplyReplicationSemanticWorkDelta,
+                [ReplicationAgentMotionPresentationDeltaKind] = TryApplyReplicationSemanticAgentMotionDelta,
+                ["AgentAnimationTriggered"] = TryApplyReplicationAgentAnimationDelta,
+                ["AgentAnimationReset"] = TryApplyReplicationAgentAnimationDelta,
+                ["AgentAnimationQuit"] = TryApplyReplicationAgentAnimationDelta,
+                ["AgentAnimationParameter"] = TryApplyReplicationAgentAnimationParameterDelta,
+                ["AgentProgressUpdated"] = TryApplyReplicationAgentProgressDelta,
+                ["AgentProgressCleared"] = TryApplyReplicationAgentProgressDelta,
+                ["AgentActionStatus"] = TryApplyReplicationAgentActionStatusDelta,
+                ["AgentActionHeartbeat"] = TryApplyReplicationAgentActionStatusDelta,
+                ["AgentActionPhase"] = TryApplyReplicationGoapActionPhaseDelta,
+                ["AgentSkillExperience"] = TryApplyReplicationAgentSkillExperienceDelta,
+                ["AgentCharacterState"] = TryApplyReplicationAgentCharacterStateDelta,
+                [AnimalStateDeltaKind] = TryApplyReplicationAnimalStateDelta,
+                ["AgentNeedLifecycle"] = TryApplyReplicationNeedsLifecycleDelta,
+                [ReplicationProductionTicketIdentityV2DeltaKind] = TryApplyReplicationProductionTicketIdentityV2,
+                [ReplicationWorkstationRuntimeDeltaKind] = TryApplyReplicationWorkstationRuntimePresentation,
+                ["GameTimeSnapshot"] = TryApplyReplicationGameTimeSnapshot,
+            };
+
+            replicationWorldObjectDeltaHandlersByKind = map;
+            return map;
+        }
+
+        private static bool TryApplyReplicationWorldObjectDelta(ReplicationWorldObjectDelta delta, out string detail)
+        {
             if (IsReplicationTraderPartyDeltaKind(delta.DeltaKind))
             {
                 return TryApplyReplicationTraderPartyWorldDelta(delta, out detail);
@@ -4604,35 +4717,6 @@ namespace GoingCooperative.Plugin.BepInEx
             if (IsReplicationEventDeltaKind(delta.DeltaKind))
             {
                 return TryApplyReplicationEventWorldDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, CombatStateDeltaKind, StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, CombatOutcomeDeltaKind, StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, CombatPresentationDeltaKind, StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, CombatHealthDeltaKind, StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, CombatDeathDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationCombatWorldDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ManagementDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationManagementDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationMedicalWoundStateDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationMedicalWorldDelta(delta, out detail);
-            }
-
-            if (string.Equals(
-                    delta.DeltaKind,
-                    ReplicationPrioritisedObjectWorkResultV1DeltaKind,
-                    StringComparison.Ordinal))
-            {
-                return TryApplyReplicationPrioritisedObjectWorkResultV1(
-                    delta,
-                    out detail);
             }
 
             if (!replicationConfigHostMode
@@ -4654,185 +4738,9 @@ namespace GoingCooperative.Plugin.BepInEx
                 return true;
             }
 
-            if (string.Equals(delta.DeltaKind, "MapResourceDisposed", StringComparison.Ordinal))
+            if (GetReplicationWorldObjectDeltaHandlersByKind().TryGetValue(delta.DeltaKind, out var handler))
             {
-                return TryApplyReplicationMapResourceDisposed(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileSpawned", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileSpawned(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileAmountAdded", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileAmountAdded(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileStateSnapshotBegin", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileStateSnapshotBegin(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileState", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileState(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileStateSnapshotEnd", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileStateSnapshotEnd(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "ResourcePileDisposed", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationResourcePileDisposed(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "TerrainGroundDestroyed", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationTerrainGroundDestroyed(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "BuildingBlueprintPlaced", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingBlueprintPlaced(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingBlueprintBatchPlacedDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingBlueprintBatchPlaced(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingBlueprintBatchResultDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingBlueprintBatchResult(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingLifecycleV2DeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingLifecycleV2(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingProgressV2DeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingProgressV2(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingRepairV2DeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingRepairV2(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationBuildingRecoveryRequiredV2DeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingRecoveryRequiredV2(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "BuildingBlueprintRejected", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingBlueprintRejected(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "BuildingStateSnapshotBegin", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingStateSnapshotBegin(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "BuildingState", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingState(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "BuildingStateSnapshotEnd", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationBuildingStateSnapshotEnd(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentCarryEquipped", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentCarryCleared", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentCarryDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentCarryResourceChanged", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentCarryResourceCleared", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentCarryResourceDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationAgentWorkPresentationDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationSemanticWorkDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationAgentMotionPresentationDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationSemanticAgentMotionDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentAnimationTriggered", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentAnimationReset", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentAnimationQuit", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentAnimationDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentAnimationParameter", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentAnimationParameterDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentProgressUpdated", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentProgressCleared", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentProgressDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentActionStatus", StringComparison.Ordinal)
-                || string.Equals(delta.DeltaKind, "AgentActionHeartbeat", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentActionStatusDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentActionPhase", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationGoapActionPhaseDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentSkillExperience", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentSkillExperienceDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentCharacterState", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAgentCharacterStateDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, AnimalStateDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationAnimalStateDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "AgentNeedLifecycle", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationNeedsLifecycleDelta(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationProductionTicketIdentityV2DeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationProductionTicketIdentityV2(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, ReplicationWorkstationRuntimeDeltaKind, StringComparison.Ordinal))
-            {
-                return TryApplyReplicationWorkstationRuntimePresentation(delta, out detail);
-            }
-
-            if (string.Equals(delta.DeltaKind, "GameTimeSnapshot", StringComparison.Ordinal))
-            {
-                return TryApplyReplicationGameTimeSnapshot(delta, out detail);
+                return handler(delta, out detail);
             }
 
             detail = "unsupported-delta-kind=" + delta.DeltaKind;
@@ -8421,6 +8329,7 @@ namespace GoingCooperative.Plugin.BepInEx
             var sleepCurrent = 0f;
             var hasHunger = replicationConfigNeedsReplication && TryReadReplicationNeedsStat(statsOwner, "Hunger", out hungerCurrent);
             var hasSleep = replicationConfigNeedsReplication && TryReadReplicationNeedsStat(statsOwner, "Sleep", out sleepCurrent);
+            TryReadReplicationAgentDisplayName(owner, out var firstName, out var lastName);
             var signature = ComputeReplicationAgentCharacterStateSignature(
                 kind,
                 hasDied,
@@ -8432,7 +8341,10 @@ namespace GoingCooperative.Plugin.BepInEx
                 isIdle,
                 isResting,
                 isDrafting,
-                combatMode,
+                // Folded into the existing change-detection signature so a renamed or
+                // newly spawned pawn re-sends; otherwise the snapshot would suppress it
+                // as unchanged and the client would keep its locally rolled name.
+                combatMode + "name=" + firstName + "" + lastName,
                 hasHunger,
                 hasHunger ? hungerCurrent : 0f,
                 hasSleep,
@@ -8462,7 +8374,118 @@ namespace GoingCooperative.Plugin.BepInEx
                 statsSignature,
                 attributesSignature,
                 skillsSignature,
-                signature);
+                signature,
+                firstName,
+                lastName);
+        }
+
+        // Names live on HumanoidInstance.Info (CharacterInfoBase.firstName/lastName).
+        // Read through the same reflection helpers as the rest of this file so a game
+        // update that moves them degrades to empty names rather than throwing.
+        private static bool TryReadReplicationAgentDisplayName(object owner, out string firstName, out string lastName)
+        {
+            firstName = string.Empty;
+            lastName = string.Empty;
+            if (!TryReadInstanceMemberValue(owner, "Info", out var info) || info == null)
+            {
+                if (!TryReadInstanceMemberValue(owner, "info", out info) || info == null)
+                {
+                    return false;
+                }
+            }
+
+            if (TryReadInstanceMemberValue(info, "firstName", out var firstValue) && firstValue is string parsedFirst)
+            {
+                firstName = parsedFirst ?? string.Empty;
+            }
+
+            if (TryReadInstanceMemberValue(info, "lastName", out var lastValue) && lastValue is string parsedLast)
+            {
+                lastName = parsedLast ?? string.Empty;
+            }
+
+            return firstName.Length > 0 || lastName.Length > 0;
+        }
+
+        private static bool TryApplyReplicationAgentDisplayName(
+            string entityId,
+            string firstName,
+            string lastName,
+            out string detail)
+        {
+            if (firstName.Length == 0 && lastName.Length == 0)
+            {
+                detail = "name-empty";
+                return false;
+            }
+
+            // Gate the lookup below on a cheap cache hit. Character-state snapshots
+            // repeat for every tracked agent, and TryFindReplicationAnimatedAgentViewByEntityId
+            // is a reflective linear scan over all agent views - running it per delta
+            // would be quadratic per snapshot cycle. Names change essentially never
+            // after spawn, so the scan happens once per entity and then never again.
+            var nameKey = firstName + " " + lastName;
+            lock (ReplicationWorldObjectDeltaLock)
+            {
+                if (ReplicationClientAppliedAgentNameByEntityId.TryGetValue(entityId, out var appliedKey)
+                    && string.Equals(appliedKey, nameKey, StringComparison.Ordinal))
+                {
+                    detail = "name-cached";
+                    return true;
+                }
+            }
+
+            if (!TryFindReplicationAnimatedAgentViewByEntityId(entityId, out var view, out var viewDetail)
+                || view == null)
+            {
+                detail = "name-view-lookup-failed " + viewDetail;
+                return false;
+            }
+
+            if (!TryResolveReplicationAgentOwnerFromView(view, out var owner, out _) || owner == null)
+            {
+                detail = "name-owner-missing";
+                return false;
+            }
+
+            if ((!TryReadInstanceMemberValue(owner, "Info", out var info) || info == null)
+                && (!TryReadInstanceMemberValue(owner, "info", out info) || info == null))
+            {
+                detail = "name-info-missing";
+                return false;
+            }
+
+            // Compare before writing: this runs on every character-state snapshot, and
+            // an unconditional write would dirty the instance (and any name-change
+            // listeners) every cycle even when nothing changed.
+            TryReadReplicationAgentDisplayName(owner, out var currentFirst, out var currentLast);
+            if (string.Equals(currentFirst, firstName, StringComparison.Ordinal)
+                && string.Equals(currentLast, lastName, StringComparison.Ordinal))
+            {
+                RecordReplicationAppliedAgentName(entityId, nameKey);
+                detail = "name-already-current";
+                return true;
+            }
+
+            var wroteFirst = TrySetInstanceMemberValue(info, "firstName", firstName);
+            var wroteLast = TrySetInstanceMemberValue(info, "lastName", lastName);
+            if (!wroteFirst && !wroteLast)
+            {
+                detail = "name-write-failed";
+                return false;
+            }
+
+            RecordReplicationAppliedAgentName(entityId, nameKey);
+            detail = "name-applied first=" + firstName + " last=" + lastName;
+            return true;
+        }
+
+        private static void RecordReplicationAppliedAgentName(string entityId, string nameKey)
+        {
+            lock (ReplicationWorldObjectDeltaLock)
+            {
+                ReplicationClientAppliedAgentNameByEntityId[entityId] = nameKey;
+            }
         }
 
         private static bool TryResolveReplicationAgentOwnerFromView(object view, out object? owner, out string detail)
@@ -12398,6 +12421,20 @@ namespace GoingCooperative.Plugin.BepInEx
                 combatMode = decodedCombatMode;
             }
 
+            var firstName = string.Empty;
+            if (TryReadReplicationWorldObjectDetailToken(delta.Detail, "firstB64", out var firstToken)
+                && TryDecodeReplicationDetailBase64(firstToken, out var decodedFirstName))
+            {
+                firstName = decodedFirstName;
+            }
+
+            var lastName = string.Empty;
+            if (TryReadReplicationWorldObjectDetailToken(delta.Detail, "lastB64", out var lastToken)
+                && TryDecodeReplicationDetailBase64(lastToken, out var decodedLastName))
+            {
+                lastName = decodedLastName;
+            }
+
             TryReadReplicationWorldObjectDetailHex(delta.Detail, "statsSig", out var statsSignature);
             TryReadReplicationWorldObjectDetailHex(delta.Detail, "attrsSig", out var attributesSignature);
             TryReadReplicationWorldObjectDetailHex(delta.Detail, "skillsSig", out var skillsSignature);
@@ -12431,12 +12468,16 @@ namespace GoingCooperative.Plugin.BepInEx
                 statsSignature,
                 attributesSignature,
                 skillsSignature,
-                signature);
+                signature,
+                firstName,
+                lastName);
 
             lock (ReplicationWorldObjectDeltaLock)
             {
                 ReplicationClientAgentCharacterStateByEntityId[entityId] = state;
             }
+
+            TryApplyReplicationAgentDisplayName(entityId, firstName, lastName, out var nameDetail);
 
             var needsDetail = "needs=gated-off";
             if (replicationConfigNeedsReplication)
@@ -12462,6 +12503,8 @@ namespace GoingCooperative.Plugin.BepInEx
                 + skillsSignature.ToString("X16", CultureInfo.InvariantCulture)
                 + " sig=0x"
                 + signature.ToString("X16", CultureInfo.InvariantCulture)
+                + " "
+                + nameDetail
                 + " "
                 + needsDetail;
             return true;
@@ -14802,8 +14845,8 @@ namespace GoingCooperative.Plugin.BepInEx
 
             if (hasResult && result != null && TryExtractReplicationWorldObjectInfoFromObject(result, 0, visited, out uniqueId, out blueprintId, out x, out y, out z, out detail))
             {
-                FillReplicationWorldObjectPositionFromArgs(args, ref x, ref y, ref z);
-                detail = "result " + detail;
+                FillReplicationWorldObjectPositionFromArgs(args, ref x, ref y, ref z, out var resultFillDiag);
+                detail = "result " + detail + (resultFillDiag.Length > 0 ? " " + resultFillDiag : string.Empty);
                 return true;
             }
 
@@ -14813,8 +14856,8 @@ namespace GoingCooperative.Plugin.BepInEx
                 {
                     if (args[i] != null && TryExtractReplicationWorldObjectInfoFromObject(args[i], 0, visited, out uniqueId, out blueprintId, out x, out y, out z, out detail))
                     {
-                        FillReplicationWorldObjectPositionFromArgs(args, ref x, ref y, ref z);
-                        detail = "arg" + i.ToString(CultureInfo.InvariantCulture) + " " + detail;
+                        FillReplicationWorldObjectPositionFromArgs(args, ref x, ref y, ref z, out var argFillDiag);
+                        detail = "arg" + i.ToString(CultureInfo.InvariantCulture) + " " + detail + (argFillDiag.Length > 0 ? " " + argFillDiag : string.Empty);
                         return true;
                     }
                 }
@@ -14876,7 +14919,12 @@ namespace GoingCooperative.Plugin.BepInEx
                     + y.ToString(CultureInfo.InvariantCulture)
                     + ","
                     + z.ToString(CultureInfo.InvariantCulture)
-                    + ")";
+                    + ")"
+                    // Diagnostic: hasId short-circuits before hasPosition is checked, so a
+                    // missing position silently defaults x/y/z to 0 here. Surface that so a
+                    // "grid=(0,0,0)" in the log can be told apart from a genuine origin spawn.
+                    + " pos="
+                    + (hasPosition ? "ok" : "missing");
                 return true;
             }
 
@@ -14894,10 +14942,13 @@ namespace GoingCooperative.Plugin.BepInEx
                     TryReadReplicationWorldObjectStringMember(value, "BlueprintId", "blueprintId", out nestedBlueprint);
                 }
 
-                if (!hasPosition)
-                {
-                    TryReadReplicationWorldObjectGridPosition(value, out x, out y, out z);
-                }
+                // hasPosition was already computed for `value` itself above and was
+                // false - re-querying the identical (value, same six field names) pair
+                // here is deterministic and can only fail again, which clobbered the
+                // valid x/y/z the nested recursive call just returned back to (0,0,0).
+                // That in turn made the caller's zero-position guard treat the position
+                // as "not yet found" and overwrite it with a wrong fallback derived from
+                // an unrelated method argument (see FillReplicationWorldObjectPositionFromArgs).
 
                 blueprintId = nestedBlueprint;
                 detail = ReplicationWorldObjectNestedMemberNames[i] + " " + detail;
@@ -15542,8 +15593,14 @@ namespace GoingCooperative.Plugin.BepInEx
             return null;
         }
 
-        private static void FillReplicationWorldObjectPositionFromArgs(object[]? args, ref int x, ref int y, ref int z)
+        // diag is a temporary diagnostic surface (see AGENTS.md-tracked spawn-failed
+        // investigation): it reports whether this fallback fired at all and, when it
+        // did, the raw vs. normalized Y so a future log capture can prove or disprove
+        // NormalizePossibleWorldY as the source of the observed GridY mismatch instead
+        // of guessing at a fix.
+        private static void FillReplicationWorldObjectPositionFromArgs(object[]? args, ref int x, ref int y, ref int z, out string diag)
         {
+            diag = string.Empty;
             if (args == null || (x != 0 || y != 0 || z != 0))
             {
                 return;
@@ -15557,7 +15614,23 @@ namespace GoingCooperative.Plugin.BepInEx
                     if (typeName.IndexOf("Vector3", StringComparison.OrdinalIgnoreCase) >= 0
                         && typeName.IndexOf("Vec3Int", StringComparison.OrdinalIgnoreCase) < 0)
                     {
+                        var rawY = y;
                         y = NormalizePossibleWorldY(y);
+                        diag = "fillFromArgs arg" + i.ToString(CultureInfo.InvariantCulture)
+                            + " type=" + FormatShortTypeName(args[i].GetType())
+                            + " raw=(" + x.ToString(CultureInfo.InvariantCulture)
+                            + "," + rawY.ToString(CultureInfo.InvariantCulture)
+                            + "," + z.ToString(CultureInfo.InvariantCulture)
+                            + ") normalizedY=" + y.ToString(CultureInfo.InvariantCulture);
+                    }
+                    else
+                    {
+                        diag = "fillFromArgs arg" + i.ToString(CultureInfo.InvariantCulture)
+                            + " type=" + FormatShortTypeName(args[i].GetType())
+                            + " xyz=(" + x.ToString(CultureInfo.InvariantCulture)
+                            + "," + y.ToString(CultureInfo.InvariantCulture)
+                            + "," + z.ToString(CultureInfo.InvariantCulture)
+                            + ")";
                     }
 
                     return;
@@ -16255,6 +16328,8 @@ namespace GoingCooperative.Plugin.BepInEx
         };
 
         private const float ReplicationWorldObjectDeltaRetrySeconds = 0.75f;
+        // Caps generic-lane backoff at 0.75s * 2^4 = 12s between attempts.
+        private const int ReplicationWorldObjectDeltaRetryBackoffMaxSteps = 4;
         private const float ReplicationBuildingStateSnapshotRetrySeconds = 3.0f;
         private const float ReplicationBuildingDurableRetrySeconds = 5.0f;
         private const float ReplicationStoragePolicyStateDurableRetrySeconds = 5.0f;
@@ -16511,11 +16586,15 @@ namespace GoingCooperative.Plugin.BepInEx
                 ulong statsSignature,
                 ulong attributesSignature,
                 ulong skillsSignature,
-                ulong signature)
+                ulong signature,
+                string firstName,
+                string lastName)
             {
                 EntityId = entityId;
                 UniqueId = uniqueId;
                 Kind = kind;
+                FirstName = firstName;
+                LastName = lastName;
                 HasDied = hasDied;
                 HasFainted = hasFainted;
                 IsSleeping = isSleeping;
@@ -16541,6 +16620,13 @@ namespace GoingCooperative.Plugin.BepInEx
             public long UniqueId { get; }
 
             public string Kind { get; }
+
+            // Procedurally rolled per side (NPCView.Setup takes its own System.Random),
+            // so without replicating them host and client show different names for the
+            // same pawn.
+            public string FirstName { get; }
+
+            public string LastName { get; }
 
             public bool HasDied { get; }
 

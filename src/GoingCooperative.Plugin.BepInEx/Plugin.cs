@@ -99,6 +99,29 @@ namespace GoingCooperative.Plugin.BepInEx
             FlushPluginLogBufferIfDue(force: true);
         }
 
+        // Diagnostic for the multi-minute frame stalls observed in testing: the perf
+        // probe showed near-zero internal replication cost during those windows, which
+        // points at something outside our per-frame code (OS-level suspension from
+        // losing window focus/being minimized, most likely). These log immediately
+        // (force flush) so the timestamp survives even if a stall follows right after.
+        private void OnApplicationFocus(bool hasFocus)
+        {
+            AppendPluginLog("Going Cooperative Application.focus changed hasFocus="
+                + hasFocus
+                + " realtimeSinceStartup=" + Time.realtimeSinceStartup.ToString("0.###", CultureInfo.InvariantCulture)
+                + " wallClockUtc=" + DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            FlushPluginLogBufferIfDue(force: true);
+        }
+
+        private void OnApplicationPause(bool pauseStatus)
+        {
+            AppendPluginLog("Going Cooperative Application.pause changed pauseStatus="
+                + pauseStatus
+                + " realtimeSinceStartup=" + Time.realtimeSinceStartup.ToString("0.###", CultureInfo.InvariantCulture)
+                + " wallClockUtc=" + DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            FlushPluginLogBufferIfDue(force: true);
+        }
+
         private void OnDestroy()
         {
             AppendPluginLog("Going Cooperative replication plugin destroyed applicationQuitting=" + applicationQuittingObserved);

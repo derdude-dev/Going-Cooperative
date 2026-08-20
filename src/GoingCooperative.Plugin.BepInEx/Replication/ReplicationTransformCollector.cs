@@ -309,11 +309,18 @@ namespace GoingCooperative.Plugin.BepInEx
                     return true;
                 }
 
-                if (string.Equals(fullName, "NSMedieval.View.NPCView", StringComparison.Ordinal)
-                    && TryGetReplicationTraderPartyViewOwner(view, out _))
+                if (string.Equals(fullName, "NSMedieval.View.NPCView", StringComparison.Ordinal))
                 {
-                    // Ordinary neutral NPCs remain outside the two-player snapshot budget.
-                    // Only host-authored external-event pawns receive this lane.
+                    // Previously restricted to trader-party pawns, which silently excluded
+                    // raiders and other hostile NPCs from the transform/motion lane: the
+                    // host replicated their health but never their position, so on the
+                    // client they stood still and only jumped on a resync. Animals already
+                    // worked because AnimalView was classified here, which is the same
+                    // pipeline this now reuses unchanged.
+                    // Budget note: collection is capped by maxSnapshotEntities (128) and
+                    // measured at ~64 in a normal session, and the npc pass runs before
+                    // the animal pass - a very large raid could therefore crowd out animal
+                    // rows before it drops npc rows.
                     kind = "npc";
                     return true;
                 }
