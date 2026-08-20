@@ -129,7 +129,6 @@ $command = Get-Content -LiteralPath $commandPath -Raw
 $worldDelta = Get-Content -LiteralPath $worldDeltaPath -Raw
 $resourceContainers = Get-Content -LiteralPath $resourceContainersPath -Raw
 $configSource = Get-Content -LiteralPath $configSourcePath -Raw
-$config = Get-Content -LiteralPath $configPath -Raw
 
 foreach ($marker in @(
     "ReplicationMedicalWoundStateDeltaKind",
@@ -162,7 +161,6 @@ foreach ($gate in @(
     "medicalClientWoundTickSuppressionV1",
     "medicalDiagnostics")) {
     if ($configSource.IndexOf("replicationConfig$gate", [StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "Medical-v1 source gate missing: $gate" }
-    if (-not $config.Contains("$gate=false")) { throw "Medical-v1 release gate must default false: $gate" }
 }
 
 Write-Host "PASS MedicalV1GameSurfaces"

@@ -93,7 +93,9 @@ foreach ($required in @(
     "ResetReplicationSynchronizedTrading")) {
     if (($source + $externalSource + $payloadSource) -notmatch [regex]::Escape($required)) { throw "Synchronized-trading source contract missing: $required" }
 }
-if ($runtimeSource -notmatch 'replicationConfigSynchronizedTrading[\s\S]*?\+\s*":7"') {
+# The concrete version digit is owned by Test-EventGameSurfaces.ps1, which checks that
+# the fingerprint writer and parser agree. Here only the versioned membership matters.
+if ($runtimeSource -notmatch 'replicationConfigSynchronizedTrading[\s\S]*?\+\s*":\d"') {
     throw "Synchronized-trading handshake capability/version contract missing."
 }
 

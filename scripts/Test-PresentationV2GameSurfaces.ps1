@@ -71,8 +71,8 @@ if ($hostMovementSource -notmatch 'ReplicationHostMovementPrefix[\s\S]*?replicat
     throw "Host-movement live prefix safety guards missing."
 }
 
-if ($config -notmatch '(?m)^hostSleepPresentationV2=true$' -or
-    $config -notmatch '(?m)^semanticAnimalPresentationV2=true$') {
+if ($config -notmatch '(?m)^hostSleepPresentationV2=true\r?$' -or
+    $config -notmatch '(?m)^semanticAnimalPresentationV2=true\r?$') {
     throw "Presentation-v2 tested package gates must be enabled."
 }
 if ($needsSource -notmatch 'pending\.HasSleep\s*&&\s*replicationConfigHostSleepPresentationV2\s*&&\s*pending\.IsSleeping') {

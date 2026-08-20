@@ -31,7 +31,9 @@ foreach ($path in @(
     }
 }
 
-Add-Type -Path $cecilPath
+# Load from bytes like every other contract script: a downloaded Mono.Cecil.dll keeps a
+# Mark-of-the-Web that makes Add-Type -Path fail with HRESULT 0x80131515.
+[void][Reflection.Assembly]::Load([IO.File]::ReadAllBytes($cecilPath))
 $assembly = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($assemblyPath)
 $types = @{}
 foreach ($type in $assembly.MainModule.Types) {
@@ -103,11 +105,10 @@ foreach ($field in @(
     }
 }
 
+# The v2 resource lanes ship enabled since v0.3.0; their fail-safe rollback default is
+# asserted on the runtime gates above. Only the diagnostic lane must stay off in the
+# tracked template, which Package-Release.ps1 enforces for every packaged build.
 foreach ($line in @(
-    "resourceStateV2=false",
-    "agentInventoryStateV2=false",
-    "groundPileStateV2=false",
-    "shelfStorageStateV2=false",
     "resourceStateV2Diagnostics=false"
 )) {
     if ($trackedConfig -notmatch "(?m)^$([regex]::Escape($line))\s*$") {

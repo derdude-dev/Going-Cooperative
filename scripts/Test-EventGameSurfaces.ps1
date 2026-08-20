@@ -170,7 +170,7 @@ if ($eventSource -notmatch 'PrepareHostReplicationTraderParty\(__instance, recor
     $eventSource -notmatch 'ResetReplicationTraderParties\(ReplicationTraderPartyResetContext\.ScopeChangedSameWorld\)') { throw "Trader party lifecycle is not linked to two-phase event start, checkpoint pruning, tombstone, and same-world reset." }
 if ($externalEventAgentsSource -notmatch '(?s)internal static bool ReplicationTraderPartySurfacesReady\(\).*?ValidateReplicationTraderPartyNativeSurfaces') { throw "Trader authority readiness must validate native party surfaces on demand before hook installation." }
 if ($externalEventAgentsSource -notmatch '(?s)"NSMedieval\.State\.TraderBehaviour",\s*"OnSettlerTalkTo",\s*new\[\]\s*\{\s*AccessTools\.TypeByName\("NSMedieval\.State\.WorkerBehaviour"\)\s*\}.*?tradeTalkPrefix' -or
-    $externalEventAgentsSource -notmatch 'replicationTraderPartyHooksReady\s*=\s*count\s*==\s*15') { throw "Trader authority must install all 15 exact party hooks, including the read-only client trader-talk guard." }
+    $externalEventAgentsSource -notmatch 'replicationTraderPartyHooksReady\s*=\s*count\s*==\s*17') { throw "Trader authority must install all 17 exact party hooks, including the read-only client trader-talk guard." }
 if ($replicationConfigSource -notmatch 'case "eventtraderauthority"' -or $replicationConfigSource -notmatch 'replicationConfigEventTraderAuthority') { throw "eventTraderAuthority is not parsed as a distinct config gate." }
 if ($eventSource -notmatch '(?s)IsReplicationTraderEventBlueprintId.*?GameEventSettingsRepository.*?GetByID.*?ClassName.*?"TraderEvent".*?"MultiTraderEvent"') { throw "StartEvent blueprint classification must resolve the native event class exactly." }
 if ($eventSource -notmatch '(?s)"NSMedieval\.GameEventSystem\.GameEventInstance",\s*"Tick".*?suppressVoid.*?"NSMedieval\.GameEventSystem\.GameEventInstance",\s*"ForceEnd".*?suppressVoid.*?"NSMedieval\.GameEventSystem\.GameEventStateMachine",\s*"SwitchPhase".*?suppressVoid') { throw "Loaded/running event graph hooks must remain behind full authority rather than the scheduler/start gate." }
@@ -285,8 +285,19 @@ if ($eventReplicationSource -notmatch '(?s)event state extraction failed event=.
 }
 $replicationRuntimeSource = Get-Content -LiteralPath $replicationRuntimeSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
-if ($replicationRuntimeSource -notmatch '\+ ":6";' -or $replicationRuntimeSource -notmatch "fingerprint\[19\] != '6'") {
-    throw "Event capability writer/parser wire versions do not both use v6."
+# Pin the writer/parser agreement rather than the version number: the fingerprint version
+# is bumped whenever an event lane is added, and both sides must move together. Both
+# patterns anchor on the event method bodies so a neighbouring capability cannot satisfy them.
+$eventWireWriter = [regex]::Match($replicationRuntimeSource, '(?s)private static string FormatReplicationEventCapabilityFingerprint\(\).*?\+ ":(\d)";')
+$eventWireParser = [regex]::Match($replicationRuntimeSource, "(?s)private static bool TryReadReplicationEventCapabilityFingerprint\(.*?fingerprint\[\d+\] != '(\d)'")
+if (-not $eventWireWriter.Success) {
+    throw "Event capability writer does not stamp a wire version."
+}
+if (-not $eventWireParser.Success) {
+    throw "Event capability parser does not verify a wire version."
+}
+if ($eventWireWriter.Groups[1].Value -ne $eventWireParser.Groups[1].Value) {
+    throw "Event capability wire versions disagree: writer v$($eventWireWriter.Groups[1].Value), parser v$($eventWireParser.Groups[1].Value)."
 }
 if ($replicationRuntimeSource -notmatch '(?s)replicationConfigEventTraderAuthority \? "1" : "0".*?TraderEventAuthorityEnabled\(\) \? "1" : "0"') { throw "Event capability does not distinguish configured from effective trader authority readiness." }
 if ($replicationRuntimeSource -notmatch '"\|gameasm="' -or

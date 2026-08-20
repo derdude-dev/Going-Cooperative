@@ -18,7 +18,7 @@ $delta = Get-Content $deltaPath -Raw
 $cfg = Get-Content $cfgPath -Raw
 
 if ($config -notmatch 'replicationConfigEventRecruitmentAuthorityV1' -or $config -notmatch 'case "eventrecruitmentauthorityv1"') { throw 'Recruitment V1 config gate is not declared and parsed.' }
-if ($cfg -notmatch '(?m)^eventRecruitmentAuthorityV1=true$') { throw 'Recruitment V1 is not enabled in the test config.' }
+if ($cfg -notmatch '(?m)^eventRecruitmentAuthorityV1=true\r?$') { throw 'Recruitment V1 is not enabled in the test config.' }
 if ($lane -notmatch '(?s)RecruitmentEventAuthorityV1Enabled\(\).*?replicationConfigEventReplication.*?replicationConfigEventLifecycleReplication.*?replicationConfigEventRecruitmentAuthorityV1.*?replicationConfigEventDialogReplication.*?replicationConfigEventChoiceCommands.*?replicationRecruitmentEventHooksReady.*?worldObjectDeltaMode.*?commandCaptureMode') { throw 'Recruitment V1 does not fail closed on every required dependency.' }
 if ($lane -notmatch 'NSMedieval\.GameEventSystem\.Events\.NewWorkerEvent' -or $lane -notmatch 'ClassName.*NewWorkerEvent') { throw 'Recruitment V1 is not exact-type and exact-blueprint allowlisted.' }
 if ($event -notmatch 'ShouldSuppressReplicationClientRecruitmentEventStart' -or $event -notmatch 'QuarantineReplicationClientNativeRecruitmentEvents') { throw 'Recruitment V1 does not suppress both new and already-running client-native recruitment events.' }

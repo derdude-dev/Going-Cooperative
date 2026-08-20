@@ -1,0 +1,4 @@
+# The replication template is compared line by line by the Test-*.ps1 contract scripts
+# and read with File.ReadAllLines at runtime, so keep it LF in every checkout instead of
+# letting core.autocrlf decide. The contract regexes tolerate CRLF as well.
+config/replication.cfg text eol=lf

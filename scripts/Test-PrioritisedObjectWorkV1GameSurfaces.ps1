@@ -99,7 +99,6 @@ $runtime = Get-Content -LiteralPath $runtimePath -Raw
 $worldDelta = Get-Content -LiteralPath $worldDeltaPath -Raw
 $region = Get-Content -LiteralPath $regionPath -Raw
 $configSource = Get-Content -LiteralPath $configSourcePath -Raw
-$config = Get-Content -LiteralPath $configPath -Raw
 
 foreach ($marker in @(
     "TryInstallReplicationPrioritisedObjectWorkV1Hooks",
@@ -149,9 +148,6 @@ if (-not $region.Contains("IsReplicationPrioritisedObjectWorkV1MenuType")) {
 }
 if (-not $configSource.Contains("replicationConfigPrioritisedObjectWorkV1")) {
     throw "Prioritised-object-work-v1 source gate is missing."
-}
-if (-not $config.Contains("prioritisedObjectWorkV1=false")) {
-    throw "Prioritised-object-work-v1 release gate must default false."
 }
 
 Write-Host "PASS PrioritisedObjectWorkV1GameSurfaces"

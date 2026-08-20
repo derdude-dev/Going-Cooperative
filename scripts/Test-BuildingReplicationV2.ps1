@@ -50,7 +50,9 @@ Require-SourcePattern $sources.ConfigSource 'replicationConfigBuildingReplicatio
     "The runtime buildingReplicationV2 default is not enabled."
 Require-SourcePattern $sources.ConfigSource 'case\s+"buildingreplicationv2"\s*:.*?TryParseConfigBool\(.*?replicationConfigBuildingReplicationV2\s*=\s*buildingReplicationV2\s*;' `
     "The buildingReplicationV2 config key is not parsed into the runtime gate."
-foreach ($gate in @("beamPlacementReplication", "beamLifecycleReplication", "socketablePlacementReplication", "beamReplicationDiagnostics")) {
+# Diagnostic lanes are owned by Package-Release.ps1, which requires every one of them
+# to ship disabled. Only the functional beam/socket gates belong in this list.
+foreach ($gate in @("beamPlacementReplication", "beamLifecycleReplication", "socketablePlacementReplication")) {
     Require-SourcePattern $sources.Config ('(?m)^\s*' + $gate + '\s*=\s*true\s*(?:[#;].*)?$') `
         ("The release config does not enable the test gate " + $gate + ".")
 }
@@ -226,7 +228,7 @@ Require-SourcePattern $sources.Lifecycle 'TryApplyReplicationBuildingRecoveryReq
     "The client has no RecoveryRequired apply path."
 Require-SourcePattern $sources.WorldDeltas 'ShouldDropReplicationWorldObjectDeltaAfterRetries\(.*?ReplicationBuildingBlueprintBatchPlacedDeltaKind.*?durableTransaction.*?TrySendReplicationBuildingRecoveryRequiredV2\(.*?ReplicationBuildingRepairV2DeltaKind.*?TrySendReplicationBuildingRecoveryRequiredV2\(' `
     "Durable placement/repair retry exhaustion does not escalate through RecoveryRequired."
-Require-SourcePattern $sources.WorldDeltas 'TryApplyReplicationWorldObjectDelta\(.*?ReplicationBuildingRecoveryRequiredV2DeltaKind.*?TryApplyReplicationBuildingRecoveryRequiredV2\(delta,\s*out\s+detail\)' `
+Require-SourcePattern $sources.WorldDeltas '\[ReplicationBuildingRecoveryRequiredV2DeltaKind\]\s*=\s*TryApplyReplicationBuildingRecoveryRequiredV2' `
     "The client world-delta dispatcher does not apply RecoveryRequired."
 Require-SourcePattern $sources.Lifecycle 'TryApplyReplicationBuildingRecoveryRequiredV2\(.*?replicationClientAppliedWorldObjectDeltaSequences\.Contains\(sourceSequence\).*?source-already-applied.*?ScheduleReplicationBuildBatchRecovery\(' `
     "RecoveryRequired cannot distinguish lost ACK from unapplied authoritative state."

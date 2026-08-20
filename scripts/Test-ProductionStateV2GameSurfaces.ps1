@@ -65,7 +65,7 @@ $runtimeBranch = [regex]::Match($runtime, 'SendHostReplicationResourceContainers
 if (-not $runtimeBranch.Success) {
     throw "Production-v2 runtime does not keep agent inventory sending while gating only legacy workstation presentation."
 }
-if ($containers -notmatch 'CollectReplicationAgentStorageContainer[\s\S]*?if \(!replicationConfigProductionStateV2\)[\s\S]*?CollectReplicationProductionStorageContainers') {
+if ($containers -notmatch 'CollectReplicationAgentStorageContainer[\s\S]*?!replicationConfigProductionStateV2[\s\S]*?CollectReplicationProductionStorageContainers') {
     throw "Production-v2 container routing does not preserve agent inventories while excluding legacy production containers."
 }
 if ($configSource -notmatch 'agent-inventory="[\s\S]*?production-containers="' -or

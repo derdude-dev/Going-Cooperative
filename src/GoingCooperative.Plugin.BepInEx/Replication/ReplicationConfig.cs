@@ -578,9 +578,13 @@ namespace GoingCooperative.Plugin.BepInEx
                 replicationConfigWorldObjectDeltaMode,
                 "off",
                 StringComparison.OrdinalIgnoreCase);
-            var agentInventoryOwner = replicationConfigResourceContainerReplication
-                ? "resource-containers"
-                : carrySnapshotAvailable ? "carry-snapshot" : "none";
+            // The v2 lane owns pawn inventory whenever it is enabled and suppresses the
+            // legacy container scan, so it has to be resolved before the legacy owners.
+            var agentInventoryOwner = ReplicationAgentInventoryStateV2Enabled()
+                ? "resource-state-v2"
+                : replicationConfigResourceContainerReplication
+                    ? "resource-containers"
+                    : carrySnapshotAvailable ? "carry-snapshot" : "none";
             var productionContainerOwner = replicationConfigResourceContainerReplication
                 ? (replicationConfigProductionStateV2 ? "production-v2" : "legacy-resource-containers")
                 : "none";

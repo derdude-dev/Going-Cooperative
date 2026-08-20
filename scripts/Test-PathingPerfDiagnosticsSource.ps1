@@ -39,7 +39,7 @@ Require-Text $collectorSource 'RecordReplicationPathingSemantic\(' "semantic met
 Require-Text $motionSource 'RecordReplicationPathingCornerExtraction\(' "corner extraction timing"
 Require-Text $motionSource 'RecordReplicationPathingMotionEvent\(' "semantic event counters"
 Require-Text $deltaSource 'RecordReplicationPathingRetryScan\(' "reliable retry work timing"
-Require-Text $trackedConfig '(?m)^pathingPerfDiagnostics=false$' "safe tracked default"
+Require-Text $trackedConfig '(?m)^pathingPerfDiagnostics=false\r?$' "safe tracked default"
 
 $diagnosticsContent = Get-Content -LiteralPath $diagnosticsSource -Raw
 if ($diagnosticsContent -match 'FindObjectsOfType|FindObjectsOfTypeAll|GetMethod\(|GetProperty\(|GetField\(') {
