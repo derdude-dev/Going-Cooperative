@@ -8344,7 +8344,7 @@ namespace GoingCooperative.Plugin.BepInEx
                 // Folded into the existing change-detection signature so a renamed or
                 // newly spawned pawn re-sends; otherwise the snapshot would suppress it
                 // as unchanged and the client would keep its locally rolled name.
-                combatMode + "name=" + firstName + "" + lastName,
+                combatMode + "\u001Fname=" + firstName + "\u001F" + lastName,
                 hasHunger,
                 hasHunger ? hungerCurrent : 0f,
                 hasSleep,
@@ -8424,7 +8424,7 @@ namespace GoingCooperative.Plugin.BepInEx
             // is a reflective linear scan over all agent views - running it per delta
             // would be quadratic per snapshot cycle. Names change essentially never
             // after spawn, so the scan happens once per entity and then never again.
-            var nameKey = firstName + " " + lastName;
+            var nameKey = firstName + "\u001F" + lastName;
             lock (ReplicationWorldObjectDeltaLock)
             {
                 if (ReplicationClientAppliedAgentNameByEntityId.TryGetValue(entityId, out var appliedKey)
