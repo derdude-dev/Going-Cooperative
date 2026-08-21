@@ -29,7 +29,7 @@ x64** loader. Players do not install BepInEx separately.
 1. Close Going Medieval.
 2. Back up important saves.
 3. Open the [Going Cooperative Releases
-   page](https://github.com/derdude-dev/Going-Cooperative/releases)).
+   page](https://github.com/derdude-dev/Going-Cooperative/releases).
 4. Download `Going-Cooperative-vX.Y.Z-win-x64.zip` from the release's
    **Assets** section.
 5. In Steam, right-click Going Medieval and select **Manage > Browse local
